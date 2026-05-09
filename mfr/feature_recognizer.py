@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import List, Dict, Optional, Tuple, Set
 
-from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_WIRE
+from OCC.Core.TopAbs import TopAbs_FACE, TopAbs_EDGE, TopAbs_WIRE, TopAbs_IN
 from OCC.Core.TopExp import TopExp_Explorer, topexp
 from OCC.Core.TopTools import (
     TopTools_IndexedMapOfShape,
@@ -27,18 +27,16 @@ from OCC.Core.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve
 from OCC.Core.BRepGProp import brepgprop
 from OCC.Core.GProp import GProp_GProps
 from OCC.Core.BRepLProp import BRepLProp_SLProps
-from OCC.Core.BRepCheck import BRepCheck_Analyzer
 from OCC.Core.GeomAbs import (
     GeomAbs_Plane,
     GeomAbs_Cylinder,
     GeomAbs_Cone,
     GeomAbs_Torus,
     GeomAbs_Sphere,
+    GeomAbs_Line,
+    GeomAbs_Circle,
 )
-from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Ax1
-from OCC.Core.BRep import BRep_Tool
-from OCC.Core.BRepTopAdaptor import BRepTopAdaptor_FClass2d
-from OCC.Core.TopLoc import TopLoc_Location
+from OCC.Core.gp import gp_Pnt, gp_Vec, gp_Dir
 
 from .utils import (
     gp_pnt_to_numpy,
@@ -263,8 +261,7 @@ def _is_inner_surface(face, shape) -> bool:
     gp_probe = gp_Pnt(probe_point[0], probe_point[1], probe_point[2])
 
     classifier = BRepClass3d_SolidClassifier(shape, gp_probe, TOLERANCE)
-    # 1 = IN, 2 = OUT, 3 = ON, 4 = UNKNOWN
-    is_inside = (classifier.State() == 1)  # TopAbs_IN
+    is_inside = (classifier.State() == TopAbs_IN)
 
     return is_inside
 
@@ -285,11 +282,12 @@ class _EdgeAdj:
     is_smooth: bool = False
 
 
-def _build_face_list(shape) -> Tuple[List, Dict]:
+def _build_face_list(shape) -> Tuple[List, List]:
     """Extract ordered face list and shape->index mapping.
 
     Returns:
-        (faces, face_to_idx)  where face_to_idx uses TopoDS_Shape.HashCode
+        (faces, face_to_idx)  where face_to_idx is a list allowing
+        lookup by _find_face_index using IsSame
     """
     face_map = TopTools_IndexedMapOfShape()
     topexp.MapShapes(shape, TopAbs_FACE, face_map)
@@ -298,23 +296,12 @@ def _build_face_list(shape) -> Tuple[List, Dict]:
     for i in range(1, face_map.Size() + 1):
         faces.append(face_map.FindKey(i))
 
-    # Build hash -> index mapping
-    face_to_idx = {}
+    return faces, faces
+
+
+def _find_face_index(target, faces, _face_to_idx_unused=None) -> Optional[int]:
     for idx, face in enumerate(faces):
-        h = face.HashCode(2**31 - 1)
-        if h not in face_to_idx:
-            face_to_idx[h] = []
-        face_to_idx[h].append(idx)
-
-    return faces, face_to_idx
-
-
-def _find_face_index(target, faces, face_to_idx) -> Optional[int]:
-    h = target.HashCode(2**31 - 1)
-    if h not in face_to_idx:
-        return None
-    for idx in face_to_idx[h]:
-        if target.IsSame(faces[idx]):
+        if target.IsSame(face):
             return idx
     return None
 
@@ -331,8 +318,9 @@ def _build_adjacency(shape, faces, face_to_idx) -> Dict[int, List[_EdgeAdj]]:
         if face_list.Size() != 2:
             continue
 
-        f1 = face_list.Value(1)
-        f2 = face_list.Value(2)
+        it = iter(face_list)
+        f1 = next(it)
+        f2 = next(it)
 
         idx1 = _find_face_index(f1, faces, face_to_idx)
         idx2 = _find_face_index(f2, faces, face_to_idx)
@@ -347,7 +335,7 @@ def _build_adjacency(shape, faces, face_to_idx) -> Dict[int, List[_EdgeAdj]]:
         # Edge type
         edge = edge_face_map.FindKey(ei)
         curve = BRepAdaptor_Curve(edge)
-        etype = {0: "line", 1: "circle", 2: "ellipse"}.get(curve.GetType(), "other")
+        etype = {GeomAbs_Line: "line", GeomAbs_Circle: "circle"}.get(curve.GetType(), "other")
 
         # Convexity classification
         smooth_tol = math.radians(5)
@@ -726,11 +714,11 @@ def _recognize_chamfers(faces, adj, shape) -> List[Feature]:
             u1 = curve.FirstParameter()
             u2 = curve.LastParameter()
             # Approximate edge length
-            if curve.GetType() == 0:  # Line
+            if curve.GetType() == GeomAbs_Line:
                 p1 = curve.Value(u1)
                 p2 = curve.Value(u2)
                 length = np.linalg.norm(gp_pnt_to_numpy(p1) - gp_pnt_to_numpy(p2))
-            elif curve.GetType() == 1:  # Circle
+            elif curve.GetType() == GeomAbs_Circle:
                 length = curve.Circle().Radius() * abs(u2 - u1)
             else:
                 length = abs(u2 - u1) * 0.1  # rough
@@ -828,13 +816,11 @@ def _recognize_chamfers(faces, adj, shape) -> List[Feature]:
         def _distance_to_plane(point, plane_face):
             """Perpendicular distance from a point to a planar face."""
             surf = BRepAdaptor_Surface(plane_face)
-            # Get plane equation: ax + by + cz + d = 0
-            plane = surf.Plane()
-            pln = plane.Position().Ax2()
-            normal = gp_dir_to_numpy(pln.Direction())
-            loc = gp_pnt_to_numpy(pln.Location())
-            d = -np.dot(normal, loc)
-            return abs(np.dot(normal, point) + d)
+            if surf.GetType() != GeomAbs_Plane:
+                return 0.0
+            pln = surf.Plane()
+            a, b, c, d = pln.Coefficients()
+            return abs(a * point[0] + b * point[1] + c * point[2] + d)
 
         dist1 = _distance_to_plane(centroid, faces[f1_idx])
         dist2 = _distance_to_plane(centroid, faces[f2_idx])
@@ -863,14 +849,14 @@ def _recognize_chamfers(faces, adj, shape) -> List[Feature]:
 # Main recognition pipeline
 # ---------------------------------------------------------------------------
 
-def recognize_features(shape) -> List[Feature]:
+def recognize_features(shape) -> Tuple[List[Feature], int]:
     """Recognize Hole, Boss, and Chamfer features from a B-Rep solid.
 
     Args:
         shape: TopoDS_Shape (should be a solid or compound of solids)
 
     Returns:
-        List of Feature objects
+        (features, num_faces) tuple
     """
     faces, face_to_idx = _build_face_list(shape)
     adj = _build_adjacency(shape, faces, face_to_idx)
@@ -886,17 +872,17 @@ def recognize_features(shape) -> List[Feature]:
     # Recognize chamfers
     features.extend(_recognize_chamfers(faces, adj, shape))
 
-    return features
+    return features, len(faces)
 
 
-def recognize_features_from_step(step_path: str) -> List[Feature]:
+def recognize_features_from_step(step_path: str) -> Tuple[List[Feature], int]:
     """Convenience: load a STEP file and recognize features.
 
     Args:
         step_path: Path to .step / .stp file
 
     Returns:
-        List of Feature objects
+        (features, num_faces) tuple
     """
     from OCC.Core.STEPControl import STEPControl_Reader
 
@@ -911,41 +897,26 @@ def recognize_features_from_step(step_path: str) -> List[Feature]:
     return recognize_features(shape)
 
 
-def features_to_json(features: List[Feature]) -> dict:
-    """Convert recognized features to a JSON-serializable dict.
+def features_to_label(features: List[Feature], num_faces: int) -> List[int]:
+    """Convert recognized features to a per-face label list.
 
-    The output format is designed for downstream labeling:
-    {
-        "features": [
-            {
-                "type": "Hole",
-                "subtype": "Through",
-                "face_indices": [3, 5],
-                "axis": [0.0, 0.0, 1.0],
-                "radius": 5.0,
-                "depth": 0.0,
-                "center": [10.0, 20.0, 0.0]
-            },
-            ...
-        ],
-        "summary": {
-            "total_features": 3,
-            "hole_count": 1,
-            "boss_count": 1,
-            "chamfer_count": 1
-        }
-    }
+    Each face gets a label:
+        0 = none/background
+        1 = Hole
+        2 = Boss
+        3 = Chamfer
+
+    Args:
+        features: List of Feature objects
+        num_faces: Total number of faces in the shape
+
+    Returns:
+        List of length num_faces, each element in {0, 1, 2, 3}
     """
-    feat_dicts = [f.to_dict() for f in features]
-
-    summary = {
-        "total_features": len(features),
-        "hole_count": sum(1 for f in features if f.feature_type == FeatureType.HOLE),
-        "boss_count": sum(1 for f in features if f.feature_type == FeatureType.BOSS),
-        "chamfer_count": sum(1 for f in features if f.feature_type == FeatureType.CHAMFER),
-    }
-
-    return {
-        "features": feat_dicts,
-        "summary": summary,
-    }
+    labels = [0] * num_faces
+    for feat in features:
+        code = int(feat.feature_type) + 1  # HOLE=1, BOSS=2, CHAMFER=3
+        for fi in feat.face_indices:
+            if 0 <= fi < num_faces:
+                labels[fi] = code
+    return labels
