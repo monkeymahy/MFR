@@ -295,7 +295,7 @@ def _build_face_list(shape) -> Tuple[List, Dict]:
     topexp.MapShapes(shape, TopAbs_FACE, face_map)
 
     faces = []
-    for i in range(1, face_map.Extent() + 1):
+    for i in range(1, face_map.Size() + 1):
         faces.append(face_map.FindKey(i))
 
     # Build hash -> index mapping
@@ -326,7 +326,7 @@ def _build_adjacency(shape, faces, face_to_idx) -> Dict[int, List[_EdgeAdj]]:
 
     adj: Dict[int, List[_EdgeAdj]] = {i: [] for i in range(len(faces))}
 
-    for ei in range(1, edge_face_map.Extent() + 1):
+    for ei in range(1, edge_face_map.Size() + 1):
         face_list = edge_face_map.FindFromIndex(ei)
         if face_list.Size() != 2:
             continue
