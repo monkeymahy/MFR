@@ -9,28 +9,9 @@ Usage:
     steps_dir : folder containing .step / .stp files
     labels_dir: output folder for JSON label files (default: <steps_dir>/../labels)
 
-Output format (one JSON per STEP file):
-{
-    "source": "example.step",
-    "features": [
-        {
-            "type": "Hole",
-            "subtype": "Through",
-            "face_indices": [3, 5],
-            "axis": [0.0, 0.0, 1.0],
-            "radius": 5.0,
-            "depth": 0.0,
-            "center": [10.0, 20.0, 0.0]
-        },
-        ...
-    ],
-    "summary": {
-        "total_features": 3,
-        "hole_count": 1,
-        "boss_count": 1,
-        "chamfer_count": 1
-    }
-}
+Output format (one JSON per STEP file, a list of per-face labels):
+    [0, 1, 0, 3, 2, ...]
+    0 = none, 1 = Hole, 2 = Boss, 3 = Chamfer
 """
 
 import argparse
@@ -45,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def process_single(step_path, label_path, verbose=False):
     """Process one STEP file and write the label JSON."""
-    from mfr.feature_recognizer import recognize_features_from_step, features_to_json
+    from mfr.feature_recognizer import recognize_features_from_step, features_to_label
 
     basename = os.path.basename(step_path)
 
@@ -54,25 +35,26 @@ def process_single(step_path, label_path, verbose=False):
 
     t0 = time.time()
     try:
-        features = recognize_features_from_step(step_path)
+        features, num_faces = recognize_features_from_step(step_path)
     except Exception as e:
         print(f"ERROR: {e}")
         return False
 
-    result = features_to_json(features)
-    result["source"] = basename
+    labels = features_to_label(features, num_faces)
 
     elapsed = time.time() - t0
 
     os.makedirs(os.path.dirname(label_path) or ".", exist_ok=True)
     with open(label_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+        json.dump(labels, f)
 
     if verbose:
         n = len(features)
-        s = result["summary"]
+        h = sum(1 for l in labels if l == 1)
+        b = sum(1 for l in labels if l == 2)
+        c = sum(1 for l in labels if l == 3)
         print(f"{n} feature(s) "
-              f"(H:{s['hole_count']} B:{s['boss_count']} C:{s['chamfer_count']}) "
+              f"(H:{h} B:{b} C:{c}) "
               f"[{elapsed:.2f}s]")
 
     return True
@@ -165,25 +147,22 @@ def main():
 
     # Aggregate statistics
     if total_ok > 0:
-        agg = {"hole": 0, "boss": 0, "chamfer": 0, "total": 0}
+        agg = {"hole": 0, "boss": 0, "chamfer": 0}
         for step_file in step_files:
             model_id = os.path.splitext(step_file)[0]
             label_path = os.path.join(labels_dir, f"{model_id}.json")
             if not os.path.exists(label_path):
                 continue
             with open(label_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            s = data.get("summary", {})
-            agg["hole"] += s.get("hole_count", 0)
-            agg["boss"] += s.get("boss_count", 0)
-            agg["chamfer"] += s.get("chamfer_count", 0)
-            agg["total"] += s.get("total_features", 0)
+                labels = json.load(f)
+            agg["hole"] += sum(1 for l in labels if l == 1)
+            agg["boss"] += sum(1 for l in labels if l == 2)
+            agg["chamfer"] += sum(1 for l in labels if l == 3)
 
-        print(f"  Aggregated features across dataset:")
-        print(f"    Holes:    {agg['hole']}")
-        print(f"    Bosses:   {agg['boss']}")
-        print(f"    Chamfers: {agg['chamfer']}")
-        print(f"    Total:    {agg['total']}")
+        print(f"  Aggregated faces across dataset:")
+        print(f"    Hole:     {agg['hole']}")
+        print(f"    Boss:     {agg['boss']}")
+        print(f"    Chamfer:  {agg['chamfer']}")
 
     print("=" * 60)
 
